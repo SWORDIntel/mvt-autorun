@@ -6,6 +6,8 @@ MVT Android Auto-Runner & Forensics Pipeline
 - Selectively downloads new and modified packages to save time and bandwidth
 - Runs Android Quick Forensics (androidqf) and Mobile Verification Toolkit (MVT)
 - Delivers persistent desktop toast notifications (0%, 50%, 100%) that stay until closed
+- Automatically archives forensic evidence to /opt/mvt/output/incidents/ if threats detected
+- Uses per-device locking to support concurrent multi-device scanning
 """
 
 import sys
@@ -26,8 +28,8 @@ CACHE_DIR = f"{MVT_ROOT}/cache/apks"
 OUTPUT_DIR = f"{MVT_ROOT}/output/latest"
 RAW_DIR = f"{OUTPUT_DIR}/raw"
 ANALYSIS_DIR = f"{OUTPUT_DIR}/analysis"
+INCIDENTS_DIR = f"{MVT_ROOT}/output/incidents"
 LOG_FILE = f"{MVT_ROOT}/logs/mvt-autorun.log"
-LOCK_FILE = "/run/lock/mvt-autorun.lock"
 
 
 def log(msg: str):
@@ -72,7 +74,6 @@ def send_toast(title: str, message: str, urgency: str = "critical"):
             if not username:
                 continue
 
-            # Command to invoke notify-send with persistence flags
             notify_cmd = [
                 "notify-send",
                 "-t", "0",
@@ -123,7 +124,6 @@ def read_device_file(serial: str, remote_path: str) -> str:
 
 
 def write_device_file(serial: str, remote_path: str, content: str):
-    # Use adb push via temp file to avoid shell quoting and truncation issues
     temp_local = f"/tmp/.mvt_sync_{int(time.time()*1000)}"
     try:
         with open(temp_local, "w") as f:
@@ -193,7 +193,6 @@ def compare_and_sync_packages(serial: str, current_hashes: dict[str, dict], raw_
     os.makedirs(CACHE_DIR, exist_ok=True)
     os.makedirs(raw_apk_dir, exist_ok=True)
 
-    # Read previous baseline from device
     old_raw = read_device_file(serial, "/sdcard/Documents/.mvt_pkg_hashes")
     old_hashes = {}
     if old_raw:
@@ -242,13 +241,11 @@ def compare_and_sync_packages(serial: str, current_hashes: dict[str, dict], raw_
             except Exception:
                 subprocess.run(["cp", "-f", cached_apk, local_target], check=False)
         else:
-            # First time this machine sees this device's unchanged app
             log(f"Host caching package {pkg_name}...")
             run_adb(["pull", data["apk_path"], local_target], serial=serial, check=False)
             if os.path.exists(local_target):
                 subprocess.run(["cp", "-f", local_target, cached_apk], check=False)
 
-    # Update baseline on device
     lines = [f"{pkg}\t{info['sha256']}\t{info['apk_path']}" for pkg, info in current_hashes.items()]
     new_baseline = "\n".join(lines)
     write_device_file(serial, "/sdcard/Documents/.mvt_pkg_hashes", new_baseline)
@@ -281,7 +278,6 @@ def enrich_packages_json(raw_dir: str, current_hashes: dict[str, dict]):
                 for f_info in files:
                     f_info["sha256"] = sha
 
-                # Extract cert info if local APK exists
                 apk_file = os.path.join(raw_dir, "apks", f"{name}.apk")
                 if os.path.exists(apk_file):
                     cert_res = subprocess.run(
@@ -316,14 +312,9 @@ def run_androidqf(serial: str, raw_dir: str):
     """
     log("Executing androidqf extraction...")
     os.makedirs(raw_dir, exist_ok=True)
-    # Ensure working directory is on the same filesystem (/opt/mvt) to prevent rename EXDEV error
     cwd = raw_dir
 
-    # Inputs:
-    # 1. Backup prompt: Down, Down, Enter (No backup)
-    # 2. Package download prompt: Down, Down, Enter (Do not download any)
     nav_input = b"\x1b[B\x1b[B\r\n\x1b[B\x1b[B\r\n\r\n\r\n"
-
     cmd = [AQF_BIN, "-fast", "-s", serial, "-o", raw_dir]
     proc = subprocess.Popen(
         cmd,
@@ -372,23 +363,25 @@ def main():
     parser.add_argument("-f", "--force", action="store_true", help="Bypass 24h rate limit")
     args = parser.parse_args()
 
-    # Acquire exclusive process lock
-    lock_fd = open(LOCK_FILE, "w")
+    serial = args.serial
+    if not serial:
+        devs = get_connected_devices()
+        if not devs:
+            log("No connected Android device in 'device' state. Exiting.")
+            sys.exit(0)
+        serial = devs[0]
+
+    # Per-device exclusive process lock (allows concurrent multi-device execution)
+    os.makedirs("/run/lock", exist_ok=True)
+    lock_file = f"/run/lock/mvt-autorun-{serial}.lock"
+    lock_fd = open(lock_file, "w")
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except IOError:
-        log("Another MVT verification process is currently active. Exiting.")
+        log(f"Another MVT verification process is currently active for device {serial}. Exiting.")
         sys.exit(0)
 
     try:
-        serial = args.serial
-        if not serial:
-            devs = get_connected_devices()
-            if not devs:
-                log("No connected Android device in 'device' state. Exiting.")
-                sys.exit(0)
-            serial = devs[0]
-
         # Verify device state
         state_proc = run_adb(["get-state"], serial=serial, check=False)
         if state_proc.stdout.strip() != "device":
@@ -407,7 +400,7 @@ def main():
             urgency="critical"
         )
 
-        # Storage cleanup: overwrite previous scan results
+        # Storage cleanup: overwrite previous scan results for routine scans
         subprocess.run(["rm", "-rf", OUTPUT_DIR], check=False)
         raw_apk_dir = f"{RAW_DIR}/apks"
         os.makedirs(raw_apk_dir, exist_ok=True)
@@ -445,10 +438,19 @@ def main():
         med = alerts["MEDIUM"]
         if crit > 0 or high > 0:
             status_msg = f"THREAT DETECTED: {crit} CRITICAL, {high} HIGH alerts!"
+            urgency = "critical"
+            # Forensic Preservation: Archive immutable copy of malicious evidence
+            timestamp_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+            incident_dir = f"{INCIDENTS_DIR}/incident_{timestamp_tag}_{serial}"
+            os.makedirs(os.path.dirname(incident_dir), exist_ok=True)
+            subprocess.run(["cp", "-a", OUTPUT_DIR, incident_dir], check=False)
+            log(f"[INCIDENT PRESERVED] Malicious scan archived to {incident_dir}")
         elif med > 0:
             status_msg = f"Completed with {med} suspicious items."
+            urgency = "normal"
         else:
             status_msg = "Clean. No indicators of compromise detected."
+            urgency = "normal"
 
         send_toast(
             "MVT Forensics (100%)",

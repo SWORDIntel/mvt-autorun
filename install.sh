@@ -6,10 +6,10 @@
 
 set -euo pipefail
 
-# Ensure running with sudo/root
+# Auto-elevate with sudo if not root
 if [ "$(id -u)" -ne 0 ]; then
-    echo "[-] This installer must be executed with root privileges (e.g. sudo ./install.sh)" >&2
-    exit 1
+    echo "[*] Non-root execution detected. Auto-elevating via sudo..."
+    exec sudo --preserve-env=DISPLAY,XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS bash "$0" "$@"
 fi
 
 TARGET_USER="${SUDO_USER:-$USER}"
