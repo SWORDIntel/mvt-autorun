@@ -14,7 +14,6 @@ fi
 
 TARGET_USER="${SUDO_USER:-$USER}"
 if [ "$TARGET_USER" = "root" ]; then
-    # Fallback to user 1000 if running directly as root
     TARGET_USER=$(id -nu 1000 2>/dev/null || echo "root")
 fi
 TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
@@ -22,7 +21,7 @@ TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 echo "[*] Target user: $TARGET_USER (home: $TARGET_HOME)"
 echo "[*] Target installation prefix: /opt/mvt"
 
-# 1. Package Dependencies
+# 1. System Package Dependencies
 echo "[*] Installing required system packages..."
 if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
@@ -33,54 +32,74 @@ if command -v apt-get >/dev/null 2>&1; then
         python3 \
         python3-venv \
         python3-pip \
+        python3-dev \
+        build-essential \
+        libusb-1.0-0 \
+        libusb-1.0-0-dev \
         libnotify-bin \
         apksigner \
         zipalign \
         curl \
         wget \
         rsync \
-        libusb-1.0-0
+        jq
 elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y android-tools python3 libnotify apksigner zipalign curl wget rsync libusbx
+    dnf install -y android-tools python3 python3-devel gcc libusb-devel libnotify apksigner zipalign curl wget rsync jq
 elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm android-tools python libnotify android-sdk-build-tools curl wget rsync libusb
+    pacman -Sy --noconfirm android-tools python base-devel libusb libnotify android-sdk-build-tools curl wget rsync jq
 fi
 
 # 2. Directory Structure
-echo "[*] Initializing /opt/mvt directories..."
+echo "[*] Initializing /opt/mvt directory tree..."
 mkdir -p /opt/mvt/{bin,indicators,cache/apks,output/latest,logs,state}
 
-# 3. AndroidQF Binary
+# 3. AndroidQF Binary (Acquisition tool)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64) AQF_ARCH="amd64" ;;
+    aarch64|arm64) AQF_ARCH="arm64" ;;
+    *) AQF_ARCH="amd64" ;;
+esac
+
 if [ -f "/opt/mvt/bin/androidqf" ]; then
     echo "[+] Found existing androidqf binary in /opt/mvt/bin/androidqf"
 elif [ -f "$SCRIPT_DIR/bin/androidqf" ]; then
-    echo "[+] Installing androidqf binary from bundle..."
+    echo "[+] Installing bundled androidqf binary..."
     cp -f "$SCRIPT_DIR/bin/androidqf" /opt/mvt/bin/androidqf
 else
-    echo "[*] Downloading latest androidqf binary release from GitHub..."
-    LATEST_AQF_URL="https://github.com/AmnestyTech/androidqf/releases/latest/download/androidqf"
-    curl -sSL -o /opt/mvt/bin/androidqf "$LATEST_AQF_URL" || {
-        echo "[-] Failed downloading from GitHub. Checking fallback..."
-    }
+    echo "[*] Fetching latest androidqf ($AQF_ARCH) from mvt-project/androidqf..."
+    DOWNLOAD_URL=$(curl -sSL "https://api.github.com/repos/mvt-project/androidqf/releases/latest" \
+        | jq -r --arg arch "$AQF_ARCH" '.assets[] | select(.name | test("linux_" + $arch)) | .browser_download_url' | head -n1)
+
+    if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "null" ]; then
+        curl -sSL -o /opt/mvt/bin/androidqf "$DOWNLOAD_URL"
+    else
+        # Direct release fallback
+        curl -sSL -o /opt/mvt/bin/androidqf "https://github.com/mvt-project/androidqf/releases/download/v1.8.3/androidqf_linux_${AQF_ARCH}_1.8.3"
+    fi
 fi
 chmod 755 /opt/mvt/bin/androidqf
 
-# 4. Python Virtual Environment & MVT
-echo "[*] Setting up MVT virtual environment in /opt/mvt/venv..."
+# 4. Python Virtual Environment & MVT (Mobile Verification Toolkit)
+echo "[*] Installing Mobile Verification Toolkit (MVT)..."
 if [ ! -d "/opt/mvt/venv" ]; then
     python3 -m venv /opt/mvt/venv
 fi
 
-# Upgrade packaging tools and install mvt
 /opt/mvt/venv/bin/pip install --upgrade pip wheel setuptools
 /opt/mvt/venv/bin/pip install mvt
 
-# Symlink mvt-android
+# Verify MVT installation
+if [ ! -f "/opt/mvt/venv/bin/mvt-android" ]; then
+    echo "[-] Error: mvt-android binary not found in virtualenv!" >&2
+    exit 1
+fi
 ln -sf /opt/mvt/venv/bin/mvt-android /opt/mvt/bin/mvt-android
+echo "[+] Mobile Verification Toolkit ($(/opt/mvt/bin/mvt-android --version 2>&1 | head -n1)) installed successfully."
 
 # 5. STIX2 Threat Indicators
-echo "[*] Fetching latest STIX2 indicators of compromise..."
+echo "[*] Downloading STIX2 indicators of compromise (Pegasus, Predator, Candiru, Stalkerware, etc.)..."
 sudo -u "$TARGET_USER" HOME="$TARGET_HOME" /opt/mvt/venv/bin/mvt-android download-iocs || true
 if [ -d "$TARGET_HOME/.local/share/mvt/indicators" ]; then
     cp -u "$TARGET_HOME/.local/share/mvt/indicators/"*.stix2 /opt/mvt/indicators/ 2>/dev/null || true
