@@ -1,25 +1,26 @@
 # MVT Android Auto-Runner & Forensics Pipeline
 
-Automated, daemonized Android spyware and compromise verification pipeline powered by **Amnesty International's Mobile Verification Toolkit (MVT)** and **Android Quick Forensics (`androidqf`)**.
+Automated, daemonized Android spyware and compromise verification pipeline powered by **Amnesty International's Mobile Verification Toolkit (MVT)** and **Android Quick Forensics (`androidqf`)**, paired with an **Android System Speedup & Ahead-Of-Time (AOT) Precompiler**.
 
-Triggers automatically whenever an Android device with USB debugging authorized connects to the machine.
+Designed for high-assurance environments to automatically acquire, inspect, and alert on indicators of compromise whenever an Android device with USB debugging connects.
 
 ---
 
 ## Key Features
 
-1. **Automatic Device Detection (`adb-device-watcher.py`)**:
-   - Runs as a `systemd` daemon listening to `adb track-devices`.
-   - Fires immediately when a connected device transitions into the `device` (authorized debug) state.
+1. **Automatic Device Detection & State Tracking (`adb-device-watcher.py`)**:
+   - Runs as a systemd daemon listening to `adb track-devices`.
+   - Fires the verification pipeline immediately when a device transitions to `device` (authorized debug) state.
+   - **Unauthorized State Alerts**: If a phone connects with screen locked or awaiting USB authorization, fires an immediate persistent desktop toast alerting the operator to unlock the device and approve the prompt.
 
-2. **Shared Cross-PC Rate Limiting (`/sdcard/Documents/.mvt_last_check`)**:
-   - Stores the last execution timestamp directly on the device's external storage.
+2. **Stateless Cross-PC 24h Rate Limiting (`/sdcard/Documents/.mvt_last_check`)**:
+   - Records verification timestamps directly on the device's shared external storage.
    - Enforces a 24-hour verification window (resetting at 00:00 midnight).
-   - Allows seamless device hand-offs between multiple PCs (e.g. Workstation and Proxmox server) without duplicate scans or maintaining centralized serial databases.
+   - Allows seamless device hand-offs between multiple workstations and hypervisors (e.g., workstation and rack server) without duplicate scans or maintaining centralized serial databases.
 
 3. **Differential Package Inventory & Hashing (`/sdcard/Documents/.mvt_pkg_hashes`)**:
-   - Calculates SHA-256 digests of installed 3rd-party and non-system packages directly on the device using native POSIX shell expansion (~0.3s execution time).
-   - Compares against the device baseline:
+   - Computes SHA-256 digests of installed 3rd-party and non-system packages directly on the device using native POSIX shell expansion (~0.3s execution time).
+   - Compares current hashes against the device baseline:
      - **Unchanged packages**: Skipped from redundant USB download; linked/served from local host cache at `/opt/mvt/cache/apks/`.
      - **New / Modified packages**: Pulled over ADB, cached locally, and enriched into `packages.json` alongside cryptographic certificate fingerprints extracted with `apksigner`.
    - Prevents USB transfer bottlenecks while ensuring modified or sideloaded APKs are immediately captured for STIX2 indicator analysis.
@@ -31,9 +32,17 @@ Triggers automatically whenever an Android device with USB debugging authorized 
      - **100% (Finished)**: Summarizes scan alerts (Clean / Threat alerts) and points to result logs.
    - Configured with `-t 0`, `-u critical`, and FreeDesktop hint `-h boolean:resident:true` to ensure notifications remain visible until manually dismissed.
 
-5. **Storage & Space Protection**:
-   - Overwrites previous scan results (`/opt/mvt/output/latest/`) on each execution.
-   - Raw and analysis folders stay lean and bounded.
+5. **Storage & Space Protection with Incident Preservation**:
+   - Routine clean scans overwrite `/opt/mvt/output/latest/` to keep host disk usage bounded.
+   - If `CRITICAL` or `HIGH` threat indicators (Pegasus, Predator, Candiru, Stalkerware) are detected, an immutable forensic archive is automatically preserved at `/opt/mvt/output/incidents/incident_<timestamp>_<serial>/`.
+
+6. **Multi-Device Concurrency**:
+   - Uses per-device locks (`/run/lock/mvt-autorun-<serial>.lock`) so multiple devices connected simultaneously are processed independently without mutual exclusion.
+
+7. **System Speedup & AOT Precompiler (`system_speedup.py`)**:
+   - Companion tool to eliminate UI latency, zero out animation delays, and precompile up to 10 selected apps directly to native machine code (`pm compile -m speed -f`).
+   - Verifies package existence via `pm path` before attempting operations.
+   - Automatically optimizes FUTO Voice Input and Whisper models when present.
 
 ---
 
@@ -49,63 +58,72 @@ Triggers automatically whenever an Android device with USB debugging authorized 
                       |   adb-device-watcher.py     |
                       |  (Monitors track-devices)   |
                       +--------------+--------------+
-                                     | state == "device"
-                                     v
-                      +-----------------------------+
-                      |      mvt-autorun.sh         |
-                      +--------------+--------------+
                                      |
-           +-------------------------+-------------------------+
-           |                                                   |
-           v                                                   v
-[Already Checked Today?]                                 [New Check Window]
-/sdcard/Documents/.mvt_last_check                              |
-starts with $(date +%Y-%m-%d)                                  v
-           |                                     +---------------------------+
-         (YES)                                   | TOAST (0%): Scan Started  |
-           |                                     +-------------+-------------+
-           v                                                   |
-       [EXIT 0]                                                v
-                                                 +---------------------------+
-                                                 | Package Differential Hash |
-                                                 | Compares vs device state: |
-                                                 | .mvt_pkg_hashes           |
-                                                 +-------------+-------------+
-                                                               |
-                                                               v
-                                                 +---------------------------+
-                                                 | Pull New/Modified APKs    |
-                                                 | Cache locally /opt/mvt/   |
-                                                 +-------------+-------------+
-                                                               |
-                                                               v
-                                                 +---------------------------+
-                                                 | Fast AndroidQF Dump       |
-                                                 | (Dumpsys, props, files)   |
-                                                 +-------------+-------------+
-                                                               |
-                                                               v
-                                                 +---------------------------+
-                                                 | TOAST (50%): Acq Complete |
-                                                 +-------------+-------------+
-                                                               |
-                                                               v
-                                                 +---------------------------+
-                                                 | MVT STIX2 IOC Analysis    |
-                                                 | (Pegasus, Predator, etc.) |
-                                                 +-------------+-------------+
-                                                               |
-                                                               v
-                                                 +---------------------------+
-                                                 | Write timestamp to phone: |
-                                                 | .mvt_last_check           |
-                                                 +-------------+-------------+
-                                                               |
-                                                               v
-                                                 +---------------------------+
-                                                 | TOAST (100%): Persistent  |
-                                                 | Summary & Results Ready   |
-                                                 +---------------------------+
+              +----------------------+----------------------+
+              |                                             |
+              | state == "unauthorized"                     | state == "device"
+              v                                             v
++---------------------------+                 +---------------------------+
+| TOAST: Unlock & Authorize |                 |      mvt-autorun.sh       |
++---------------------------+                 +-------------+-------------+
+                                                            |
+           +------------------------------------------------+
+           |
+           v
+[Already Checked Today?]
+/sdcard/Documents/.mvt_last_check
+starts with $(date +%Y-%m-%d)
+           |
+    +------+------+
+    |             |
+  (YES)          (NO)
+    |             |
+    v             v
+ [EXIT 0]   +---------------------------+
+            | TOAST (0%): Scan Started  |
+            +-------------+-------------+
+                          |
+                          v
+            +---------------------------+
+            | Package Differential Hash |
+            | Compares vs device state: |
+            | .mvt_pkg_hashes           |
+            +-------------+-------------+
+                          |
+                          v
+            +---------------------------+
+            | Pull New/Modified APKs    |
+            | Cache locally /opt/mvt/   |
+            +-------------+-------------+
+                          |
+                          v
+            +---------------------------+
+            | Fast AndroidQF Dump       |
+            | (Dumpsys, props, files)   |
+            +-------------+-------------+
+                          |
+                          v
+            +---------------------------+
+            | TOAST (50%): Acq Complete |
+            +-------------+-------------+
+                          |
+                          v
+            +---------------------------+
+            | MVT STIX2 IOC Analysis    |
+            | (Pegasus, Predator, etc.) |
+            +-------------+-------------+
+                          |
+                          v
+            +---------------------------+
+            | Write timestamp to phone: |
+            | .mvt_last_check           |
+            +-------------+-------------+
+                          |
+                          v
+            +---------------------------+
+            | TOAST (100%): Persistent  |
+            | Summary & Results Ready   |
+            +---------------------------+
 ```
 
 ---
@@ -119,7 +137,8 @@ starts with $(date +%Y-%m-%d)                                  v
 │   ├── mvt-android                # Symlink to /opt/mvt/venv/bin/mvt-android
 │   ├── mvt-autorun.py             # Core pipeline orchestrator
 │   ├── mvt-autorun.sh             # Execution wrapper
-│   └── adb-device-watcher.py      # Background device state daemon
+│   ├── adb-device-watcher.py      # Background device state daemon
+│   └── system_speedup.py          # Android speedup & AOT compiler
 ├── cache/
 │   └── apks/                      # Host-side persistent APK cache
 ├── indicators/                    # Downloaded STIX2 threat signatures
@@ -127,45 +146,50 @@ starts with $(date +%Y-%m-%d)                                  v
 │   ├── mvt-autorun.log            # Execution timeline and triage log
 │   └── mvt-watcher.log            # Device connect/disconnect log
 ├── output/
-│   └── latest/                    # Overwritten on each scan
-│       ├── raw/                   # Acquired androidqf dumps & packages
-│       └── analysis/              # MVT JSON detection reports
+│   ├── latest/                    # Overwritten on each routine scan
+│   │   ├── raw/                   # Acquired androidqf dumps & packages
+│   │   └── analysis/              # MVT JSON detection reports
+│   └── incidents/                 # Preserved forensic archives for positive alerts
 └── venv/                          # Python 3 virtualenv with MVT
 ```
 
 ---
 
-## Installation
+## Installation & Setup
 
-Run the automated installer as root:
+Clone the repository and run the self-elevating setup script:
 
 ```bash
 git clone https://github.com/SWORDIntel/mvt-autorun.git
 cd mvt-autorun
-sudo ./install.sh
+./setup.sh
 ```
 
-The installer configures:
-- Package dependencies (`adb`, `libnotify-bin`, `apksigner`, `zipalign`, `python3-venv`, etc.)
-- Python virtual environment with `mvt`
-- Current STIX2 threat indicators
-- Systemd service `mvt-watcher.service` (enabled and started)
+*(Note: `setup.sh` and `install.sh` automatically elevate to root privileges via `sudo -E` while preserving desktop session variables).*
+
+### What the Installer Configures:
+- **System Tooling**: `adb`, `fastboot`, `apksigner`, `zipalign`, `libnotify-bin`, `python3-venv`, `build-essential`, `libusb-1.0-0`, `jq`, `unzip`.
+- **Google SDK Fallback**: If `adb` is missing from distro packages, automatically downloads Google's Android Platform-Tools to `/usr/local/bin/`.
+- **USB Permissions (`udev`)**: Deploys `/etc/udev/rules.d/51-android.rules` with broad vendor IDs (Google, Samsung, OnePlus, Xiaomi, Huawei, Motorola, etc.) and assigns the user to `plugdev` and `adbusers`.
+- **MVT Environment**: Creates `/opt/mvt/venv`, installs `mvt`, and symlinks `mvt-android`.
+- **STIX2 Signatures**: Runs `mvt-android download-iocs` to populate `/opt/mvt/indicators/`.
+- **Systemd Daemon**: Deploys, enables, and starts `mvt-watcher.service`.
 
 ---
 
-## Manual Verification & CLI Usage
+## Manual Execution & CLI Options
 
-To manually trigger a verification against a connected device (e.g. bypassing the 24-hour rate limit):
+To run manually against a connected device (e.g. bypassing the 24-hour rate limit):
 
 ```bash
-# Force run bypass 24h limit
+# Force run bypassing 24h limit
 /opt/mvt/bin/mvt-autorun.sh --force
 
 # Target specific device serial
 /opt/mvt/bin/mvt-autorun.sh -s <SERIAL> --force
 ```
 
-To monitor watcher status:
+To monitor watcher status and real-time logs:
 
 ```bash
 systemctl status mvt-watcher.service
@@ -176,7 +200,7 @@ tail -f /opt/mvt/logs/mvt-autorun.log
 
 ## System Speedup & AOT Precompiler (`system_speedup.py`)
 
-A companion utility to maximize phone responsiveness, eliminate UI frame drops, and compile critical apps directly to machine code using Android's Ahead-Of-Time (AOT) ART compiler:
+A companion utility to maximize phone responsiveness, eliminate UI frame drops, and compile critical apps directly to native machine code using Android's Ahead-Of-Time (AOT) ART compiler:
 
 ```bash
 # Interactive mode (select up to 10 installed apps from numbered list)
@@ -195,11 +219,14 @@ A companion utility to maximize phone responsiveness, eliminate UI frame drops, 
 3. **App Standby Elevation**: Sets selected packages to `active` bucket so the OS never throttles them.
 4. **Doze Whitelist**: Exempts selected packages from battery optimization sleep states (`dumpsys deviceidle whitelist +<pkg>`).
 5. **Full AOT Compilation**: Compiles the selected APKs to native machine code (`pm compile -m speed -f <pkg>`), verified via `dumpsys package <pkg> | grep status=speed`.
-6. **FUTO Voice Input Tuning**: Automatically grants audio/notification permissions and binds whisper inference parameters.
+6. **Package Verification**: Uses `pm path` to verify package existence before running commands, cleanly skipping uninstalled packages.
+7. **FUTO Voice Input Tuning**: Automatically grants audio/notification permissions and binds whisper inference parameters.
 
 ---
 
 ## Uninstallation
+
+To completely remove the background service and `/opt/mvt` directory:
 
 ```bash
 sudo ./uninstall.sh
