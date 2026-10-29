@@ -174,6 +174,31 @@ tail -f /opt/mvt/logs/mvt-autorun.log
 
 ---
 
+## System Speedup & AOT Precompiler (`system_speedup.py`)
+
+A companion utility to maximize phone responsiveness, eliminate UI frame drops, and compile critical apps directly to machine code using Android's Ahead-Of-Time (AOT) ART compiler:
+
+```bash
+# Interactive mode (select up to 10 installed apps from numbered list)
+./system_speedup.py
+
+# Automatically select top heavy apps (YouTube, FlorisBoard, FUTO Voice, Signal, etc.)
+./system_speedup.py --defaults
+
+# Custom package selection with zero-lag animations
+./system_speedup.py -a "dev.patrickgold.florisboard,org.futo.voiceinput,com.discord" --anim 0.0
+```
+
+### Optimizations Applied:
+1. **Zero-Lag Animations**: Sets `window_animation_scale`, `transition_animation_scale`, and `animator_duration_scale` to `0.0`.
+2. **Cached Apps Freezer**: Enables ActivityManager cached app freezer to prevent background CPU cycles.
+3. **App Standby Elevation**: Sets selected packages to `active` bucket so the OS never throttles them.
+4. **Doze Whitelist**: Exempts selected packages from battery optimization sleep states (`dumpsys deviceidle whitelist +<pkg>`).
+5. **Full AOT Compilation**: Compiles the selected APKs to native machine code (`pm compile -m speed -f <pkg>`), verified via `dumpsys package <pkg> | grep status=speed`.
+6. **FUTO Voice Input Tuning**: Automatically grants audio/notification permissions and binds whisper inference parameters.
+
+---
+
 ## Uninstallation
 
 ```bash

@@ -151,11 +151,13 @@ if [ -d "$TARGET_HOME/.local/share/mvt/indicators" ]; then
 fi
 
 # 8. Install Pipeline Binaries
-echo "[*] Installing autorun orchestrator and watcher daemon..."
+echo "[*] Installing autorun orchestrator, speedup utility, and watcher daemon..."
 cp -f "$SCRIPT_DIR/bin/mvt-autorun.py" /opt/mvt/bin/mvt-autorun.py
 cp -f "$SCRIPT_DIR/bin/mvt-autorun.sh" /opt/mvt/bin/mvt-autorun.sh
 cp -f "$SCRIPT_DIR/bin/adb-device-watcher.py" /opt/mvt/bin/adb-device-watcher.py
+cp -f "$SCRIPT_DIR/bin/system_speedup.py" /opt/mvt/bin/system_speedup.py
 chmod 755 /opt/mvt/bin/*.py /opt/mvt/bin/*.sh
+ln -sf /opt/mvt/bin/system_speedup.py /usr/local/bin/system_speedup 2>/dev/null || true
 
 # Set ownership
 chown -R "$TARGET_USER:$TARGET_USER" /opt/mvt
