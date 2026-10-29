@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.DS_Store
+output/
+cache/
+venv/
+state/
+*.lock

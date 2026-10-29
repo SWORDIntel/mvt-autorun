@@ -1,0 +1,17 @@
+[Unit]
+Description=MVT Android Device Watcher and Auto-Runner
+After=network.target
+
+[Service]
+Type=simple
+User=john
+Group=john
+WorkingDirectory=/opt/mvt
+ExecStart=/opt/mvt/bin/adb-device-watcher.py
+Restart=always
+RestartSec=5
+Environment=PATH=/opt/mvt/venv/bin:/opt/mvt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/home/john
+
+[Install]
+WantedBy=multi-user.target
