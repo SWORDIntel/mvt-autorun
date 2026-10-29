@@ -80,18 +80,40 @@ def get_installed_packages(serial: str) -> list[str]:
     return sorted(pkgs)
 
 
-def optimize_futo_if_installed(serial: str, pkgs: list[str]):
+def check_package_exists(serial: str, pkg: str) -> bool:
+    """
+    Verifies whether a package physically exists and is installed on device.
+    """
+    res = run_adb(["shell", f"pm path {pkg} 2>/dev/null"], serial=serial, check=False)
+    return "package:" in res.stdout
+
+
+def optimize_futo_if_installed(serial: str, pkgs: list[str] | None = None):
+    """
+    Checks if FUTO Voice Input exists on the device before executing optimizations.
+    """
     futo_pkg = "org.futo.voiceinput"
-    if futo_pkg in pkgs:
-        print(f"\n[*] Optimizing FUTO Voice Input ({futo_pkg})...")
-        run_adb(["shell", f"pm grant {futo_pkg} android.permission.RECORD_AUDIO"], serial=serial, check=False)
-        run_adb(["shell", f"pm grant {futo_pkg} android.permission.POST_NOTIFICATIONS"], serial=serial, check=False)
-        run_adb(["shell", f"dumpsys deviceidle whitelist +{futo_pkg}"], serial=serial, check=False)
-        run_adb(["shell", f"am set-standby-bucket {futo_pkg} active"], serial=serial, check=False)
-        print("  [+] Granted audio & notification permissions, whitelisted in Doze.")
+    if not check_package_exists(serial, futo_pkg):
+        return
+
+    print(f"\n[*] Detected FUTO Voice Input ({futo_pkg}) on device. Applying optimizations...")
+    run_adb(["shell", f"pm grant {futo_pkg} android.permission.RECORD_AUDIO"], serial=serial, check=False)
+    run_adb(["shell", f"pm grant {futo_pkg} android.permission.POST_NOTIFICATIONS"], serial=serial, check=False)
+    run_adb(["shell", f"dumpsys deviceidle whitelist +{futo_pkg}"], serial=serial, check=False)
+    run_adb(["shell", f"am set-standby-bucket {futo_pkg} active"], serial=serial, check=False)
+    print("  [+] Granted audio & notification permissions, whitelisted in Doze, elevated to active.")
 
 
 def compile_and_tune_app(serial: str, pkg: str) -> dict:
+    if not check_package_exists(serial, pkg):
+        print(f"\n[-] Package '{pkg}' is not installed on device. Skipping.")
+        return {
+            "package": pkg,
+            "elapsed_sec": 0.0,
+            "status": "not_found",
+            "verified": False
+        }
+
     print(f"\n[*] Optimizing package: {pkg}")
 
     # 1. Battery Optimization / Doze Whitelist
