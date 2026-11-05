@@ -1,163 +1,25 @@
 # MVT Android Auto-Runner & Forensics Pipeline
 
-Automated, daemonized Android spyware and compromise verification pipeline powered by **Amnesty International's Mobile Verification Toolkit (MVT)** and **Android Quick Forensics (`androidqf`)**, paired with an **Android System Speedup & Ahead-Of-Time (AOT) Precompiler**.
+Android acquisition and indicator analysis using Amnesty International’s Mobile Verification Toolkit (MVT) and Android Quick Forensics (`androidqf`). A systemd watcher starts the pipeline when an authorized Android device connects.
 
-Designed for high-assurance environments to automatically acquire, inspect, and alert on indicators of compromise whenever an Android device with USB debugging connects.
+This is **not a write-blocked acquisition workflow**: it writes scan state to the phone and stores evidence on the host. A negative result is not proof that a device is clean.
 
----
+## Contents
 
-## Key Features
+- [Installation](#installation)
+- [Scanning and notifications](#scanning-and-notifications)
+- [Diagnostics](#diagnostics)
+- [Evidence and positive results](#evidence-and-positive-results)
+- [Signatures and verification](#signatures-and-verification)
+- [Storage policy](#storage-policy)
+- [Native hashing and development](#native-hashing-and-development)
+- [Optional speedup utility](#optional-speedup-utility)
+- [Uninstallation](#uninstallation)
+- [License](#license)
 
-1. **Automatic Device Detection & State Tracking (`adb-device-watcher.py`)**:
-   - Runs as a systemd daemon listening to `adb track-devices`.
-   - Fires the verification pipeline immediately when a device transitions to `device` (authorized debug) state.
-   - **Unauthorized State Alerts**: If a phone connects with screen locked or awaiting USB authorization, fires an immediate persistent desktop toast alerting the operator to unlock the device and approve the prompt.
+## Installation
 
-2. **Stateless Cross-PC 24h Rate Limiting (`/sdcard/Documents/.mvt_last_check`)**:
-   - Records verification timestamps directly on the device's shared external storage.
-   - Enforces a 24-hour verification window (resetting at 00:00 midnight).
-   - Allows seamless device hand-offs between multiple workstations and hypervisors (e.g., workstation and rack server) without duplicate scans or maintaining centralized serial databases.
-
-3. **Differential Package Inventory & Hashing (`/sdcard/Documents/.mvt_pkg_hashes`)**:
-   - Computes SHA-256 digests of installed 3rd-party and non-system packages directly on the device using native POSIX shell expansion (~0.3s execution time).
-   - Compares current hashes against the device baseline:
-     - **Unchanged packages**: Skipped from redundant USB download; linked/served from local host cache at `/opt/mvt/cache/apks/`.
-     - **New / Modified packages**: Pulled over ADB, cached locally, and enriched into `packages.json` alongside cryptographic certificate fingerprints extracted with `apksigner`.
-   - Prevents USB transfer bottlenecks while ensuring modified or sideloaded APKs are immediately captured for STIX2 indicator analysis.
-
-4. **Persistent Desktop Toast Notifications**:
-   - Delivers notifications to the host PC's graphical monitor (`DISPLAY=:0`, `/run/user/*/bus`):
-     - **0% (Start)**: Triggered upon connection, detailing target serial.
-     - **50% (Acquisition Complete)**: Reports package count, differential additions, and initiates IOC checking.
-     - **100% (Finished)**: Summarizes scan alerts (Clean / Threat alerts) and points to result logs.
-   - Configured with `-t 0`, `-u critical`, and FreeDesktop hint `-h boolean:resident:true` to ensure notifications remain visible until manually dismissed.
-
-5. **Storage & Space Protection with Incident Preservation**:
-   - Routine clean scans overwrite `/opt/mvt/output/latest/` to keep host disk usage bounded.
-   - If `CRITICAL` or `HIGH` threat indicators (Pegasus, Predator, Candiru, Stalkerware) are detected, an immutable forensic archive is automatically preserved at `/opt/mvt/output/incidents/incident_<timestamp>_<serial>/`.
-
-6. **Multi-Device Concurrency**:
-   - Uses per-device locks (`/run/lock/mvt-autorun-<serial>.lock`) so multiple devices connected simultaneously are processed independently without mutual exclusion.
-
-7. **System Speedup & AOT Precompiler (`system_speedup.py`)**:
-   - Companion tool to eliminate UI latency, zero out animation delays, and precompile up to 10 selected apps directly to native machine code (`pm compile -m speed -f`).
-   - Verifies package existence via `pm path` before attempting operations.
-   - Automatically optimizes FUTO Voice Input and Whisper models when present.
-
----
-
-## Architecture Flow
-
-```
-                      +-----------------------------+
-                      |   Android Device Connects   |
-                      +--------------+--------------+
-                                     |
-                                     v
-                      +-----------------------------+
-                      |   adb-device-watcher.py     |
-                      |  (Monitors track-devices)   |
-                      +--------------+--------------+
-                                     |
-              +----------------------+----------------------+
-              |                                             |
-              | state == "unauthorized"                     | state == "device"
-              v                                             v
-+---------------------------+                 +---------------------------+
-| TOAST: Unlock & Authorize |                 |      mvt-autorun.sh       |
-+---------------------------+                 +-------------+-------------+
-                                                            |
-           +------------------------------------------------+
-           |
-           v
-[Already Checked Today?]
-/sdcard/Documents/.mvt_last_check
-starts with $(date +%Y-%m-%d)
-           |
-    +------+------+
-    |             |
-  (YES)          (NO)
-    |             |
-    v             v
- [EXIT 0]   +---------------------------+
-            | TOAST (0%): Scan Started  |
-            +-------------+-------------+
-                          |
-                          v
-            +---------------------------+
-            | Package Differential Hash |
-            | Compares vs device state: |
-            | .mvt_pkg_hashes           |
-            +-------------+-------------+
-                          |
-                          v
-            +---------------------------+
-            | Pull New/Modified APKs    |
-            | Cache locally /opt/mvt/   |
-            +-------------+-------------+
-                          |
-                          v
-            +---------------------------+
-            | Fast AndroidQF Dump       |
-            | (Dumpsys, props, files)   |
-            +-------------+-------------+
-                          |
-                          v
-            +---------------------------+
-            | TOAST (50%): Acq Complete |
-            +-------------+-------------+
-                          |
-                          v
-            +---------------------------+
-            | MVT STIX2 IOC Analysis    |
-            | (Pegasus, Predator, etc.) |
-            +-------------+-------------+
-                          |
-                          v
-            +---------------------------+
-            | Write timestamp to phone: |
-            | .mvt_last_check           |
-            +-------------+-------------+
-                          |
-                          v
-            +---------------------------+
-            | TOAST (100%): Persistent  |
-            | Summary & Results Ready   |
-            +---------------------------+
-```
-
----
-
-## Directory Structure
-
-```
-/opt/mvt/
-├── bin/
-│   ├── androidqf                  # Android Quick Forensics x86_64 ELF
-│   ├── mvt-android                # Symlink to /opt/mvt/venv/bin/mvt-android
-│   ├── mvt-autorun.py             # Core pipeline orchestrator
-│   ├── mvt-autorun.sh             # Execution wrapper
-│   ├── adb-device-watcher.py      # Background device state daemon
-│   └── system_speedup.py          # Android speedup & AOT compiler
-├── cache/
-│   └── apks/                      # Host-side persistent APK cache
-├── indicators/                    # Downloaded STIX2 threat signatures
-├── logs/
-│   ├── mvt-autorun.log            # Execution timeline and triage log
-│   └── mvt-watcher.log            # Device connect/disconnect log
-├── output/
-│   ├── latest/                    # Overwritten on each routine scan
-│   │   ├── raw/                   # Acquired androidqf dumps & packages
-│   │   └── analysis/              # MVT JSON detection reports
-│   └── incidents/                 # Preserved forensic archives for positive alerts
-└── venv/                          # Python 3 virtualenv with MVT
-```
-
----
-
-## Installation & Setup
-
-Clone the repository and run the self-elevating setup script:
+Requirements: Linux, systemd/udev, Python 3.10+, an authorized USB-debugging connection, and network access for installation and indicator updates. A graphical session is optional; notifications and automatic folder opening require the installation user’s desktop session.
 
 ```bash
 git clone https://github.com/SWORDIntel/mvt-autorun.git
@@ -165,69 +27,189 @@ cd mvt-autorun
 ./setup.sh
 ```
 
-*(Note: `setup.sh` and `install.sh` automatically elevate to root privileges via `sudo -E` while preserving desktop session variables).*
+`setup.sh` delegates to the root-elevating `install.sh`. The installer supports apt, dnf, and pacman branches; that is not a claim that every distro/package combination has been tested. It installs the compiler/OpenSSL dependencies, builds the native hash helper, installs the application tools, downloads indicators, retains the licence files, and enables the watcher.
 
-### What the Installer Configures:
-- **System Tooling**: `adb`, `fastboot`, `apksigner`, `zipalign`, `libnotify-bin`, `python3-venv`, `build-essential`, `libusb-1.0-0`, `jq`, `unzip`.
-- **Google SDK Fallback**: If `adb` is missing from distro packages, automatically downloads Google's Android Platform-Tools to `/usr/local/bin/`.
-- **USB Permissions (`udev`)**: Deploys `/etc/udev/rules.d/51-android.rules` with broad vendor IDs (Google, Samsung, OnePlus, Xiaomi, Huawei, Motorola, etc.) and assigns the user to `plugdev` and `adbusers`.
-- **MVT Environment**: Creates `/opt/mvt/venv`, installs `mvt`, and symlinks `mvt-android`.
-- **STIX2 Signatures**: Runs `mvt-android download-iocs` to populate `/opt/mvt/indicators/`.
-- **Systemd Daemon**: Deploys, enables, and starts `mvt-watcher.service`.
+Application download versions and SHA-256 values are recorded in [`dependencies.json`](dependencies.json). Python dependencies are pinned and hash-checked through [`requirements-pinned.txt`](requirements-pinned.txt). Downloads are verified before installation; existing binaries are not trusted merely because they are present. `installed-tools.json` records the installed selection and provenance. During install, a machine-named Ed25519 signing key is created or safely reused under the target user's `~/.ssh/`; it is not an SSH login key. Its private half is mode 0600, configured for manifest signing, and its public half is retained for trust distribution. Reinstall does not replace the named key. Back up the private key securely; losing it prevents future signatures from that identity, and changing it changes the machine audit label. Distribution packages, the OS, and the compiler remain platform dependencies rather than a bit-for-bit reproducible OS image.
 
----
+The managed Android USB rule grants group-controlled access to USB devices advertising an Android debugging interface, not world-writable access to every USB device. An exact legacy rule installed by older versions can be backed up and migrated; administrator-written rules are preserved. Other rules can still grant broader access, which must be reviewed separately. Log out and back in for new group membership to apply.
 
-## Manual Execution & CLI Options
+The installer’s desktop dependencies include `gdbus` (`libglib2.0-bin` on Debian, `glib2` on Fedora/Arch). Automatic folder opening uses the standard `org.freedesktop.FileManager1` interface and does not change global desktop notification preferences.
 
-To run manually against a connected device (e.g. bypassing the 24-hour rate limit):
+## Scanning and notifications
+
+The watcher monitors `adb track-devices`. Unlock the phone and approve its USB-debugging authorization prompt before scanning.
+
+The first scan notice shows the last recorded successful scan and the next due time in **GMT**. Scheduling uses GMT/UTC calendar days, not rolling 24-hour intervals. New tokens contain ISO 8601 UTC timestamps; older timezone-less tokens are interpreted in the host’s local timezone. A not-due device receives a schedule notice and is skipped. `--force` overrides the due-time check while still showing the recorded schedule.
+
+Due scans report these stages:
+
+| Progress | Stage |
+| --- | --- |
+| 0% | Schedule checked; scan starting |
+| 25% | APK inventory and verified cache synchronization complete |
+| 50% | AndroidQF acquisition and per-file metadata enrichment complete |
+| 75% | MVT analysis complete |
+| 100% | Required evidence preservation and device-state commits complete |
+
+All popups request normal urgency and a 3-second expiry without a resident hint. The desktop notification daemon ultimately controls display timing.
+
+The pipeline inventories **base and split APKs for third-party packages**. Every APK is hashed independently on the device and verified after download or cache reuse. Each run receives independent copies rather than mutable links to the cache. Hashes and signing-certificate metadata are assigned to their matching APK paths, not copied from the base APK to every split. This is still not a full acquisition of all system APKs or all device data.
+
+Run manually as the installation user, replacing `SERIAL` with a value from `adb devices`:
 
 ```bash
-# Force run bypassing 24h limit
-/opt/mvt/bin/mvt-autorun.sh --force
-
-# Target specific device serial
-/opt/mvt/bin/mvt-autorun.sh -s <SERIAL> --force
+/opt/mvt/bin/mvt-autorun.sh --serial SERIAL
+/opt/mvt/bin/mvt-autorun.sh --serial SERIAL --force
 ```
 
-To monitor watcher status and real-time logs:
+Without `--serial`, the first authorized device is selected. A per-device lock prevents overlapping scans of the same phone; different devices have independent run directories.
+
+Phone state is stored in `/sdcard/Documents/.mvt_pkg_hashes`, `.mvt_audit_history` (last five successful machine/key-label audit entries), and `.mvt_last_check`. The package baseline and the last-five-machine audit history are committed before the daily token, only after required collection, analysis, manifest generation, and incident preservation succeed. History entries contain the configured machine key name, UTC audit time and run identifier. Each phone-state file is staged and renamed, but the files are not a cross-file transaction. A failure may leave earlier files advanced; the daily token is written last. Use `--force` to retry if an earlier same-day token exists.
+
+## Diagnostics
+
+`doctor` checks readiness without acquiring a phone, starting a scan, opening a folder, or changing settings:
+
+```bash
+/opt/mvt/bin/mvt-autorun.sh doctor
+/opt/mvt/bin/mvt-autorun.sh doctor --source /path/to/mvt-autorun --json
+```
+
+Checks cover installed-versus-source files, installed tool metadata, service health, ADB authorization, indicator availability/age, storage, desktop integration, and native hashing readiness. Unavailable or incomplete checks are reported rather than silently treated as successful. Indicator age is an operational signal, not a guarantee of detection coverage.
+
+For source-checkout diagnostics:
+
+```bash
+make native
+python3 bin/mvt-autorun.py doctor --root /opt/mvt --source . --json
+```
+
+Useful service commands:
 
 ```bash
 systemctl status mvt-watcher.service
+journalctl -u mvt-watcher.service -f
 tail -f /opt/mvt/logs/mvt-autorun.log
 ```
 
----
+## Evidence and positive results
 
-## System Speedup & AOT Precompiler (`system_speedup.py`)
+The installation uses this layout:
 
-A companion utility to maximize phone responsiveness, eliminate UI frame drops, and compile critical apps directly to native machine code using Android's Ahead-Of-Time (AOT) ART compiler:
-
-```bash
-# Interactive mode (select up to 10 installed apps from numbered list)
-./system_speedup.py
-
-# Automatically select top heavy apps (YouTube, FlorisBoard, FUTO Voice, Signal, etc.)
-./system_speedup.py --defaults
-
-# Custom package selection with zero-lag animations
-./system_speedup.py -a "dev.patrickgold.florisboard,org.futo.voiceinput,com.discord" --anim 0.0
+```text
+bin/                         Runtime scripts, helpers and mvt-hash
+installed-tools.json         Installed application provenance
+config.json                  Optional storage/signing policy
+indicators/                  Host indicator collection
+cache/apks/                  Verified APK cache
+state/locks/                 Device, publication and cache locks
+output/runs/<id>/            Independent evidence for each run
+output/latest                Link to the most recent completed run
+output/incidents/<id>/       Preserved positive-result snapshots
 ```
 
-### Optimizations Applied:
-1. **Zero-Lag Animations**: Sets `window_animation_scale`, `transition_animation_scale`, and `animator_duration_scale` to `0.0`.
-2. **Cached Apps Freezer**: Enables ActivityManager cached app freezer to prevent background CPU cycles.
-3. **App Standby Elevation**: Sets selected packages to `active` bucket so the OS never throttles them.
-4. **Doze Whitelist**: Exempts selected packages from battery optimization sleep states (`dumpsys deviceidle whitelist +<pkg>`).
-5. **Full AOT Compilation**: Compiles the selected APKs to native machine code (`pm compile -m speed -f <pkg>`), verified via `dumpsys package <pkg> | grep status=speed`.
-6. **Package Verification**: Uses `pm path` to verify package existence before running commands, cleanly skipping uninstalled packages.
-7. **FUTO Voice Input Tuning**: Automatically grants audio/notification permissions and binds whisper inference parameters.
+Each run contains `raw/`, `analysis/`, a run-specific indicator snapshot, lifecycle metadata (`run.json`), and an evidence manifest. Acquisition and analysis logs are `raw/androidqf_run.log` and `analysis/mvt_run.log`. Provenance records the tool selection/fingerprints, timestamps and the indicator data used for the run. Analysis uses the captured indicator set rather than silently loading unrelated host defaults.
 
----
+A successful **HIGH** or **CRITICAL** result preserves `flagged_apks/` with independently verified APK copies and `findings.json`. Selection follows structured MVT package, hash and path evidence. Package-level findings can identify an application’s APK set; file-specific findings retain the matching artifacts. Unrelated APKs are not labelled malicious. Unmatched findings, including unavailable system APKs and non-APK indicators, remain report-only. MEDIUM results are suspicious but do not meet this automatic preservation/opening threshold.
+
+After a positive scan completes, the preserved incident’s `flagged_apks/` directory is opened in the installation user’s file manager. The installer prints the exact incident location and reminds the operator to inspect and manually delete unwanted suspicious APKs/cases; automatic cleanup never removes incident folders. APKs themselves are **never opened, executed or installed**. A missing desktop/file manager, headless session or D-Bus error produces a warning and the folder path without invalidating the completed scan.
+
+Nonzero tool exits, timeouts, incomplete MVT summaries or required evidence-preservation failures fail the run closed. Failed runs remain available and never become `latest`. Existing legacy `latest` directories are moved to a unique retained legacy run rather than deleted. Completion notices point to the specific run, not a moving link. Updating the convenience `latest` link or final lifecycle metadata can warn after an otherwise successful scan; neither warning turns completed acquisition into a failed scan.
+
+Artifacts and incident copies are not immutable. Keep independent backups and protect access to the host, signing keys and trusted verification material. Detection quality depends on indicators, acquisition coverage and the upstream tools; inspect the evidence, not just the final toast.
+
+## Signatures and verification
+
+The evidence manifest fingerprints stable collected artifacts and records provenance. Mutable top-level `run.json` lifecycle metadata is explicitly excluded, and runtime locks live outside the evidence tree. Final status changes therefore do not invalidate the captured evidence. Verification checks for changed, missing and unexpected artifacts without following paths outside the case.
+
+```bash
+/opt/mvt/bin/mvt-autorun.sh verify /opt/mvt/output/runs/RUN_ID
+```
+
+Unsigned hash verification detects inconsistency but does **not** authenticate a manifest against an attacker who can replace both the data and manifest.
+
+Optional Ed25519 signing uses an operator-provided private key; the program does not generate one automatically. For example, create a private directory and key outside the evidence tree:
+
+```bash
+umask 077
+mkdir -p "$HOME/.local/share/mvt-signing"
+openssl genpkey -algorithm ED25519 -out "$HOME/.local/share/mvt-signing/private.pem"
+openssl pkey -in "$HOME/.local/share/mvt-signing/private.pem" -pubout \
+  -out "$HOME/.local/share/mvt-signing/trusted-public.pem"
+```
+
+Set `signing_key` in `/opt/mvt/config.json` to the private-key path. Keep private keys access-restricted and preserve the trusted public key independently. Signing errors do not silently fall back to unsigned evidence.
+
+```bash
+/opt/mvt/bin/mvt-autorun.sh verify /opt/mvt/output/incidents/INCIDENT_ID \
+  --public-key "$HOME/.local/share/mvt-signing/trusted-public.pem" --require-signature
+```
+
+A public key stored alongside evidence is not, by itself, a trust anchor. Authenticated verification requires a trusted key supplied independently.
+
+## Storage policy
+
+Collection checks free space before consuming storage, including configured reserve and estimated APK-copy requirements. Insufficient space is a scan failure, not a reason to discard old incidents.
+
+Retention is **disabled by default**. A policy example for `/opt/mvt/config.json` is:
+
+```json
+{
+  "min_free_bytes": 1073741824,
+  "run_retention_days": 30,
+  "cache_retention_days": 90,
+  "auto_prune": false,
+  "signing_key": null
+}
+```
+
+Preview candidates before explicitly applying a policy:
+
+```bash
+/opt/mvt/bin/mvt-autorun.sh prune --run-days 30 --cache-days 90
+/opt/mvt/bin/mvt-autorun.sh prune --run-days 30 --cache-days 90 --apply
+```
+
+Setting `auto_prune` to `true` opts into automatic cleanup using the configured ages. Incidents, positive results, the latest completed run, active scans and unrecognized legacy data are protected; failed evidence is retained for investigation. Cache cleanup coordinates with active cache users. In addition, after each successful scan the cache drops APK blobs not used by that scan; independent run evidence and suspicious incident copies remain intact. This per-run cache pruning does not delete previously collected run evidence. Logs and protected evidence still require an operator-managed retention/backup policy.
+
+## Native hashing and development
+
+Host file SHA-256 verification uses the compiled `mvt-hash` C binary backed by OpenSSL EVP. There is no silent Python file-hashing fallback. Device-side inventory uses Android’s `sha256sum`; the host helper is not an Android executable.
+
+On Debian, development prerequisites include Python 3.10+, Bash, Make, a C11 compiler, `libssl-dev`, `pkg-config`, and OpenSSL. Equivalent development packages are needed elsewhere.
+
+```bash
+make native
+bin/mvt-hash --self-test
+bin/mvt-hash -- path/to/file.apk
+make check
+```
+
+The Python adapter supports batched, NUL-delimited filenames so spaces and newlines are not misparsed. Machine-protocol file inputs must be regular files: the native tool rejects symlinks and FIFOs. Human-readable hashing also supports standard input, while NUL-delimited machine inputs always identify literal filenames.
+
+Checks build the real C utility, validate Python/shell syntax, exercise CLI help and run unit plus offline fake-tool integration tests. Crypto tests use temporary keys and real OpenSSL operations. Tests do not require a phone, root, desktop popups or network access. They do not establish actual-device acquisition completeness or live desktop compatibility. CI runs the suite on Python 3.10 and 3.13.
+
+## Optional speedup utility
+
+`system_speedup.py` is a separate device-changing convenience utility, **not** a forensic step. It can change Android settings, permissions and compilation state.
+
+```bash
+/opt/mvt/bin/system_speedup.py --serial SERIAL --defaults
+/opt/mvt/bin/system_speedup.py --serial SERIAL --apps com.example.app --anim 0
+```
 
 ## Uninstallation
-
-To completely remove the background service and `/opt/mvt` directory:
 
 ```bash
 sudo ./uninstall.sh
 ```
+
+Back up evidence and the signing private key first: uninstallation removes `/opt/mvt`, including output, cache, configuration, logs and the virtual environment, but leaves the per-machine signing key and public key in the installation user's `~/.ssh/`. It does not remove installed system packages, groups, USB rules or the `/usr/local/bin/` speedup symlink.
+
+## License
+
+This repository is distributed under the **SWORD Restricted Source Licence (SRSL-1.1)** in [`LICENSE`](LICENSE). It is source-available, not OSI open source. Eligible non-commercial use is permitted subject to the full licence; commercial exploitation requires a separately executed written agreement.
+
+The current text is also available as [`LICENSES/LicenseRef-SRSL-1.1.txt`](LICENSES/LicenseRef-SRSL-1.1.txt). [`LICENSES/SRSL-1.0.txt`](LICENSES/SRSL-1.0.txt) is a historical archive, not an alternative licence choice. The supplied 1.1 text contains internal references to 1.0 and has been copied verbatim; this summary does not amend its terms.
+
+Third-party tools and libraries, including [MVT](https://github.com/mvt-project/mvt), [androidqf](https://github.com/mvt-project/androidqf) and [OpenSSL](https://www.openssl.org/), retain their own licences. This licence does not override them.
