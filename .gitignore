@@ -8,3 +8,4 @@ cache/
 venv/
 state/
 *.lock
+bin/mvt-hash

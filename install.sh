@@ -5,6 +5,8 @@
 # ==============================================================================
 
 set -euo pipefail
+umask 022
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Auto-elevate with sudo if not root
 if [ "$(id -u)" -ne 0 ]; then
@@ -17,6 +19,7 @@ if [ "$TARGET_USER" = "root" ]; then
     TARGET_USER=$(id -nu 1000 2>/dev/null || echo "root")
 fi
 TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+TARGET_GROUP=$(id -gn "$TARGET_USER")
 
 echo "[*] Target user: $TARGET_USER (home: $TARGET_HOME)"
 echo "[*] Target installation prefix: /opt/mvt"
@@ -35,9 +38,13 @@ if command -v apt-get >/dev/null 2>&1; then
         python3-pip \
         python3-dev \
         build-essential \
+        libssl-dev \
+        openssl \
+        pkg-config \
         libusb-1.0-0 \
         libusb-1.0-0-dev \
         libnotify-bin \
+        libglib2.0-bin \
         apksigner \
         zipalign \
         curl \
@@ -46,85 +53,46 @@ if command -v apt-get >/dev/null 2>&1; then
         jq \
         unzip
 elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y android-tools python3 python3-devel gcc libusb-devel libnotify apksigner zipalign curl wget rsync jq unzip
+    dnf install -y android-tools python3 python3-devel openssl openssl-devel gcc make pkgconf libusb-devel libnotify glib2 apksigner zipalign curl wget rsync jq unzip
 elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm android-tools python base-devel libusb libnotify android-sdk-build-tools curl wget rsync jq unzip
+    pacman -Sy --noconfirm android-tools python openssl base-devel pkgconf libusb libnotify glib2 android-sdk-build-tools curl wget rsync jq unzip
+else
+    echo "[-] Unsupported package manager; install the documented OS dependencies first." >&2
+    exit 1
 fi
 
-# 2. ADB & Platform-Tools Verification (with Google SDK fallback)
-if ! command -v adb >/dev/null 2>&1; then
-    echo "[!] adb not found via package manager. Downloading Google Platform-Tools..."
-    TMP_PT=$(mktemp -d)
-    curl -sSL -o "$TMP_PT/platform-tools.zip" "https://dl.google.com/android/repository/platform-tools-latest-linux.zip"
-    unzip -q "$TMP_PT/platform-tools.zip" -d "$TMP_PT"
-    install -m 755 "$TMP_PT/platform-tools/adb" /usr/local/bin/adb
-    install -m 755 "$TMP_PT/platform-tools/fastboot" /usr/local/bin/fastboot
-    rm -rf "$TMP_PT"
-    echo "[+] adb successfully installed to /usr/local/bin/adb"
-else
-    echo "[+] adb found: $(command -v adb) ($(adb version 2>&1 | head -n1))"
+# 2. Only distribution-managed ADB is supported; no unverified SDK fallback.
+ADB_BIN=/usr/bin/adb
+if [ ! -x "$ADB_BIN" ]; then
+    echo "[-] OS-managed adb is required; no verified fallback is configured." >&2
+    exit 1
 fi
+echo "[+] adb found: $ADB_BIN ($("$ADB_BIN" version 2>&1 | head -n1))"
+
+# Validate the lock/architecture before publishing tools, then build the SHA backend.
+python3 "$SCRIPT_DIR/tools/install_dependencies.py" validate --source "$SCRIPT_DIR"
+mkdir -p /opt/mvt/{bin,indicators,cache/apks,output,logs,state}
+make -C "$SCRIPT_DIR" native
+install -m 755 "$SCRIPT_DIR/bin/mvt-hash" /opt/mvt/bin/mvt-hash
+/opt/mvt/bin/mvt-hash --self-test
+ln -sf "$ADB_BIN" /opt/mvt/bin/adb
 
 # 3. Android USB Udev Rules & User Groups
 echo "[*] Configuring Android USB udev permissions..."
-groupadd -f plugdev
 groupadd -f adbusers
-usermod -aG plugdev,adbusers "$TARGET_USER" 2>/dev/null || true
-
-UDEV_RULE_FILE="/etc/udev/rules.d/51-android.rules"
-if [ ! -f "$UDEV_RULE_FILE" ]; then
-    echo "[*] Installing universal Android udev rules..."
-    cat > "$UDEV_RULE_FILE" << 'EOF'
-# Universal Android USB Debugging Rules
-SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", MODE="0666", GROUP="plugdev" # Google / Pixel
-SUBSYSTEM=="usb", ATTR{idVendor}=="04e8", MODE="0666", GROUP="plugdev" # Samsung
-SUBSYSTEM=="usb", ATTR{idVendor}=="2717", MODE="0666", GROUP="plugdev" # Xiaomi
-SUBSYSTEM=="usb", ATTR{idVendor}=="22d9", MODE="0666", GROUP="plugdev" # OnePlus / Oppo
-SUBSYSTEM=="usb", ATTR{idVendor}=="12d1", MODE="0666", GROUP="plugdev" # Huawei
-SUBSYSTEM=="usb", ATTR{idVendor}=="2a70", MODE="0666", GROUP="plugdev" # OnePlus
-SUBSYSTEM=="usb", ATTR{idVendor}=="0bb4", MODE="0666", GROUP="plugdev" # HTC
-SUBSYSTEM=="usb", ATTR{idVendor}=="22b8", MODE="0666", GROUP="plugdev" # Motorola
-SUBSYSTEM=="usb", ATTR{idVendor}=="0fce", MODE="0666", GROUP="plugdev" # Sony
-SUBSYSTEM=="usb", ATTR{idVendor}=="1004", MODE="0666", GROUP="plugdev" # LG
-SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", MODE="0666", GROUP="plugdev"
-EOF
-    if command -v udevadm >/dev/null 2>&1; then
-        udevadm control --reload-rules 2>/dev/null || true
-        udevadm trigger 2>/dev/null || true
-    fi
+usermod -aG adbusers "$TARGET_USER"
+python3 "$SCRIPT_DIR/tools/install_dependencies.py" udev --source "$SCRIPT_DIR"
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules
+    udevadm trigger --subsystem-match=usb
 fi
 
 # 4. Directory Structure
 echo "[*] Initializing /opt/mvt directory tree..."
-mkdir -p /opt/mvt/{bin,indicators,cache/apks,output/latest,logs,state}
+mkdir -p /opt/mvt/{bin,indicators,cache/apks,output,logs,state}
 
-# 5. AndroidQF Binary (Acquisition tool)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ARCH="$(uname -m)"
-case "$ARCH" in
-    x86_64) AQF_ARCH="amd64" ;;
-    aarch64|arm64) AQF_ARCH="arm64" ;;
-    *) AQF_ARCH="amd64" ;;
-esac
-
-if [ -f "/opt/mvt/bin/androidqf" ]; then
-    echo "[+] Found existing androidqf binary in /opt/mvt/bin/androidqf"
-elif [ -f "$SCRIPT_DIR/bin/androidqf" ]; then
-    echo "[+] Installing bundled androidqf binary..."
-    cp -f "$SCRIPT_DIR/bin/androidqf" /opt/mvt/bin/androidqf
-else
-    echo "[*] Fetching latest androidqf ($AQF_ARCH) from mvt-project/androidqf..."
-    DOWNLOAD_URL=$(curl -sSL "https://api.github.com/repos/mvt-project/androidqf/releases/latest" 2>/dev/null \
-        | jq -r --arg arch "$AQF_ARCH" '.assets[] | select(.name | test("linux_" + $arch)) | .browser_download_url' 2>/dev/null | head -n1 || true)
-
-    if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "null" ]; then
-        curl -sSL -o /opt/mvt/bin/androidqf "$DOWNLOAD_URL"
-    else
-        # Direct release fallback
-        curl -sSL -o /opt/mvt/bin/androidqf "https://github.com/mvt-project/androidqf/releases/download/v1.8.3/androidqf_linux_${AQF_ARCH}_1.8.3"
-    fi
-fi
-chmod 755 /opt/mvt/bin/androidqf
+# 5. AndroidQF: reuse only matching pins; stage, verify, chmod, then atomically publish.
+python3 "$SCRIPT_DIR/tools/install_dependencies.py" androidqf --source "$SCRIPT_DIR"
 
 # 6. Python Virtual Environment & MVT (Mobile Verification Toolkit)
 echo "[*] Installing Mobile Verification Toolkit (MVT)..."
@@ -132,8 +100,11 @@ if [ ! -d "/opt/mvt/venv" ]; then
     python3 -m venv /opt/mvt/venv
 fi
 
-/opt/mvt/venv/bin/pip install --upgrade pip wheel setuptools
-/opt/mvt/venv/bin/pip install mvt
+/opt/mvt/venv/bin/python -m pip --isolated install \
+    --index-url https://pypi.org/simple --disable-pip-version-check \
+    --timeout 30 --retries 2 --require-hashes --only-binary=:all: --force-reinstall \
+    -r "$SCRIPT_DIR/requirements-pinned.txt"
+/opt/mvt/venv/bin/python -m pip --isolated check
 
 # Verify MVT installation
 if [ ! -f "/opt/mvt/venv/bin/mvt-android" ]; then
@@ -145,9 +116,18 @@ echo "[+] Mobile Verification Toolkit ($(/opt/mvt/bin/mvt-android --version 2>&1
 
 # 7. STIX2 Threat Indicators
 echo "[*] Downloading STIX2 indicators of compromise (Pegasus, Predator, Candiru, Stalkerware, etc.)..."
-sudo -u "$TARGET_USER" HOME="$TARGET_HOME" /opt/mvt/venv/bin/mvt-android download-iocs || true
-if [ -d "$TARGET_HOME/.local/share/mvt/indicators" ]; then
-    cp -u "$TARGET_HOME/.local/share/mvt/indicators/"*.stix2 /opt/mvt/indicators/ 2>/dev/null || true
+if ! sudo -u "$TARGET_USER" HOME="$TARGET_HOME" /opt/mvt/venv/bin/mvt-android download-iocs; then
+    echo "[!] Indicator refresh failed; retaining existing local indicators. Check freshness with doctor." >&2
+fi
+(
+    shopt -s nullglob
+    indicators=("$TARGET_HOME/.local/share/mvt/indicators/"*.stix2)
+    if [ "${#indicators[@]}" -gt 0 ]; then
+        cp -u -- "${indicators[@]}" /opt/mvt/indicators/
+    fi
+)
+if [ -z "$(find /opt/mvt/indicators -type f -name '*.stix2' -print -quit)" ]; then
+    echo "[!] No indicator files are available. Scans will fail closed until indicators are added; run doctor." >&2
 fi
 
 # 8. Install Pipeline Binaries
@@ -156,11 +136,31 @@ cp -f "$SCRIPT_DIR/bin/mvt-autorun.py" /opt/mvt/bin/mvt-autorun.py
 cp -f "$SCRIPT_DIR/bin/mvt-autorun.sh" /opt/mvt/bin/mvt-autorun.sh
 cp -f "$SCRIPT_DIR/bin/adb-device-watcher.py" /opt/mvt/bin/adb-device-watcher.py
 cp -f "$SCRIPT_DIR/bin/system_speedup.py" /opt/mvt/bin/system_speedup.py
+install -m 644 "$SCRIPT_DIR/bin/mvt_hash.py" /opt/mvt/bin/mvt_hash.py
+install -m 755 "$SCRIPT_DIR/bin/mvt_doctor.py" /opt/mvt/bin/mvt_doctor.py
+install -m 644 "$SCRIPT_DIR/bin/mvt_evidence.py" /opt/mvt/bin/mvt_evidence.py
+install -m 644 "$SCRIPT_DIR/dependencies.json" "$SCRIPT_DIR/requirements-pinned.txt" /opt/mvt/
+# Record real installed versions/digests and the source locks, after checking MVT's schema.
+python3 "$SCRIPT_DIR/tools/install_dependencies.py" record --source "$SCRIPT_DIR"
 chmod 755 /opt/mvt/bin/*.py /opt/mvt/bin/*.sh
 ln -sf /opt/mvt/bin/system_speedup.py /usr/local/bin/system_speedup 2>/dev/null || true
 
+# Preserve the licence and version archive with installed copies.
+install -m 644 "$SCRIPT_DIR/LICENSE" /opt/mvt/LICENSE
+mkdir -p /opt/mvt/LICENSES
+install -m 644 "$SCRIPT_DIR/LICENSES/"*.txt /opt/mvt/LICENSES/
+
 # Set ownership
-chown -R "$TARGET_USER:$TARGET_USER" /opt/mvt
+chown -R "$TARGET_USER:$TARGET_GROUP" /opt/mvt
+
+# Create/reuse a machine-named Ed25519 evidence-signing identity; never overwrite keys.
+SIGNING_IDENTITY=$(python3 "$SCRIPT_DIR/tools/install_dependencies.py" signing-key \
+    --source "$SCRIPT_DIR" --root /opt/mvt --home "$TARGET_HOME" \
+    --user "$TARGET_USER" --hostname "$(hostname -s)")
+MACHINE_KEY_NAME=$(printf '%s' "$SIGNING_IDENTITY" | jq -r '.machine_key_name')
+echo "[+] Evidence signing key: $TARGET_HOME/.ssh/$MACHINE_KEY_NAME.pem"
+echo "[+] Machine audit label:  $MACHINE_KEY_NAME"
+echo "[!] Review incidents after each positive scan. Remove unwanted cases manually from /opt/mvt/output/incidents/<incident-id>/flagged_apks; these suspicious APKs are intentionally retained."
 
 # 9. Systemd Service
 echo "[*] Deploying systemd service..."
@@ -172,7 +172,7 @@ After=network.target
 [Service]
 Type=simple
 User=$TARGET_USER
-Group=$TARGET_USER
+Group=$TARGET_GROUP
 WorkingDirectory=/opt/mvt
 ExecStart=/opt/mvt/bin/adb-device-watcher.py
 Restart=always
@@ -188,12 +188,12 @@ systemctl daemon-reload
 systemctl enable --now mvt-watcher.service
 
 # Start ADB server under user session
-sudo -u "$TARGET_USER" HOME="$TARGET_HOME" adb start-server >/dev/null 2>&1 || true
+sudo -u "$TARGET_USER" HOME="$TARGET_HOME" "$ADB_BIN" start-server >/dev/null 2>&1 || true
 
 echo ""
 echo "=============================================================================="
 echo "[+] MVT Android Auto-Runner and complete Android tooling installed!"
-echo "[+] ADB:              $(command -v adb)"
+echo "[+] ADB:              $ADB_BIN"
 echo "[+] MVT Android:      /opt/mvt/bin/mvt-android"
 echo "[+] AndroidQF:        /opt/mvt/bin/androidqf"
 echo "[+] Watcher Status:   $(systemctl is-active mvt-watcher.service)"
